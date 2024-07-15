@@ -13,6 +13,13 @@ In the backward pass, the gradients flow to both, handled by different kernels
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
 
+#include <unordered_set>
+#include <assert.h>
+
+#include <cuda_runtime.h>
+#include <cuda/ptx>
+
+
 // ----------------------------------------------------------------------------
 // CUDA kernels
 
@@ -163,6 +170,141 @@ void encoder_forward(floatX* out,
     const int grid_size = CEIL_DIV(N, (int)(block_size * x128::size));
     encoder_forward_kernel3<<<grid_size, block_size, 0, stream>>>(out, inp, wte, wpe, B, T, C);
     cudaCheck(cudaGetLastError());
+}
+
+template<typename Type>
+__global__ void embedding_backward_kernel(
+    Type *dweight, // VOCAB_SIZE, DIM
+    const Type *dout, // B, T, DIM
+    const int *input_tokens, // B, T
+    const int *tokens_for_thread_blocks, // n_unique_tokens
+    const size_t n_splits,
+    const int B,
+    const int T,
+    const int DIM
+) {
+    extern __shared__ Type smem[]; // X, DIM
+    __shared__ uint64_t barrier;
+    int smem_copies = 0;
+    int thread_block_token = tokens_for_thread_blocks[blockIdx.x / n_splits];
+
+    size_t dim = DIM / n_splits;
+    assert(dim % 16 == 0);
+    size_t offset = (blockIdx.x % n_splits) * dim;
+
+    if (threadIdx.x == 0) {
+        cuda::ptx::mbarrier_init(&barrier, 1);
+
+        cuda::ptx::fence_proxy_async(cuda::ptx::space_cluster);
+
+        for (int token_idx = 0; token_idx < B*T; ++token_idx) {
+            if (input_tokens[token_idx] == thread_block_token) {
+                cuda::ptx::cp_async_bulk(
+                    cuda::ptx::space_cluster, 
+                    cuda::ptx::space_global, 
+                    smem + smem_copies * dim, 
+                    dout + token_idx * DIM + offset, 
+                    dim * sizeof(Type), 
+                    &barrier
+                );
+                ++smem_copies;
+            }
+        }
+
+        cuda::ptx::mbarrier_arrive_expect_tx(
+            cuda::ptx::sem_release, 
+            cuda::ptx::scope_cta, 
+            cuda::ptx::space_shared, 
+            &barrier, 
+            dim * sizeof(Type) * smem_copies
+        );
+    }
+
+    __syncthreads();
+
+    bool complete = false;
+    while (!complete) {
+        complete = cuda::ptx::mbarrier_try_wait_parity(&barrier, 0);
+    }
+
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < smem_copies; ++i) {
+            cuda::ptx::cp_reduce_async_bulk(
+                cuda::ptx::space_global, 
+                cuda::ptx::space_shared, 
+                cuda::ptx::op_add, 
+                dweight + thread_block_token * DIM + offset, 
+                smem + i * dim, 
+                dim * sizeof(Type)
+            );
+        }
+    }
+}
+
+template<typename Type>
+void embedding_backward(
+    Type *dweight,
+    const Type *dout, 
+    const int *input_tokens_device,
+    const int *input_tokens_host,
+    int B,
+    int T,
+    int C,
+    cudaStream_t stream
+) {
+    int n_unique_tokens = 0;
+    int *tokens_for_thread_blocks_host = new int[B*T]; // TODO - populate
+
+    std::unordered_set<int> unique_tokens;
+
+    for (int i = 0; i < B * T; ++i) {
+        int token = input_tokens_host[i];
+        
+        if (unique_tokens.find(token) == unique_tokens.end()) {
+            unique_tokens.insert(token);
+            tokens_for_thread_blocks_host[n_unique_tokens] = token;
+            ++n_unique_tokens;
+        }
+    }
+
+    int *tokens_for_thread_blocks_device;
+    cudaCheck(cudaMalloc(&tokens_for_thread_blocks_device, n_unique_tokens * sizeof(int)));
+    cudaCheck(cudaMemcpy(tokens_for_thread_blocks_device, tokens_for_thread_blocks_host, n_unique_tokens * sizeof(int), cudaMemcpyHostToDevice));
+
+    int max_dynamic_shared_memory = 230000;
+    size_t n_splits = 100;
+
+    cudaFuncSetAttribute(embedding_backward_kernel<Type>, cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_shared_memory);
+
+    embedding_backward_kernel<Type><<<n_unique_tokens*n_splits, 128, max_dynamic_shared_memory, stream>>>(
+        dweight,
+        dout, 
+        input_tokens_device, 
+        tokens_for_thread_blocks_device,
+        n_splits,
+        B,
+        T,
+        C
+    );
+    cudaCheck(cudaGetLastError());
+    cudaCheck(cudaFree(tokens_for_thread_blocks_device));
+
+    delete[] tokens_for_thread_blocks_host;
+}
+
+void encoder_backward_tma(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
+                      int* workload_indices, int4* bucket_info,    // cpu scratch buffers
+                      const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
+                      int B, int T, int C, unsigned int seed, cudaStream_t stream) {
+    NVTX_RANGE_FN();
+
+    const int block_size = 256;
+    const int N = T * C / x128::size;
+    const int grid_size = CEIL_DIV(N, block_size);
+    wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
+    cudaCheck(cudaGetLastError());
+
+    embedding_backward(dwte, dout, inp, inputs_cpu, B, T, C, stream);
 }
 
 // Fully deterministic (see comments in wte_backward_kernel and wpe_backward_kernel for more details)
