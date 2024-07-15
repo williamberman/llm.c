@@ -178,7 +178,7 @@ __global__ void embedding_backward_kernel(
     const Type *dout, // B, T, DIM
     const int *input_tokens, // B, T
     const int *tokens_for_thread_blocks, // n_unique_tokens
-    const size_t n_splits,
+    const int n_splits,
     const int B,
     const int T,
     const int DIM
@@ -188,9 +188,9 @@ __global__ void embedding_backward_kernel(
     int smem_copies = 0;
     int thread_block_token = tokens_for_thread_blocks[blockIdx.x / n_splits];
 
-    size_t dim = DIM / n_splits;
+    int dim = DIM / n_splits;
     assert(dim % 16 == 0);
-    size_t offset = (blockIdx.x % n_splits) * dim;
+    int offset = (blockIdx.x % n_splits) * dim;
 
     if (threadIdx.x == 0) {
         cuda::ptx::mbarrier_init(&barrier, 1);
@@ -272,7 +272,7 @@ void embedding_backward(
     cudaCheck(cudaMemcpy(tokens_for_thread_blocks_device, tokens_for_thread_blocks_host, n_unique_tokens * sizeof(int), cudaMemcpyHostToDevice));
 
     int max_dynamic_shared_memory = 230000;
-    size_t n_splits = 100;
+    int n_splits = 48; // 100;
 
     cudaFuncSetAttribute(embedding_backward_kernel<Type>, cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_shared_memory);
 
