@@ -253,17 +253,25 @@ void embedding_backward(
     cudaStream_t stream
 ) {
     int n_unique_tokens = 0;
-    int *tokens_for_thread_blocks_host = new int[B*T]; // TODO - populate
+    int *tokens_for_thread_blocks_host = new int[B*T];
 
     std::unordered_set<int> unique_tokens;
+    std::unordered_map<int, int> token_frequencies;
+    int max_frequency = 0;
 
     for (int i = 0; i < B * T; ++i) {
         int token = input_tokens_host[i];
-        
-        if (unique_tokens.find(token) == unique_tokens.end()) {
-            unique_tokens.insert(token);
+
+        if (token_frequencies.find(token) == token_frequencies.end()) {
             tokens_for_thread_blocks_host[n_unique_tokens] = token;
+            token_frequencies[token] = 1;
             ++n_unique_tokens;
+        } else {
+            ++token_frequencies[token];
+        }
+
+        if (token_frequencies[token] > max_frequency) {
+            max_frequency = token_frequencies[token];
         }
     }
 
@@ -272,7 +280,12 @@ void embedding_backward(
     cudaCheck(cudaMemcpy(tokens_for_thread_blocks_device, tokens_for_thread_blocks_host, n_unique_tokens * sizeof(int), cudaMemcpyHostToDevice));
 
     int max_dynamic_shared_memory = 230000;
-    int n_splits = 48; // 100;
+    int smem_of_most_frequent_token = max_frequency * C * sizeof(Type);
+
+    int n_splits = 1;
+    while (C % n_splits != 0 || smem_of_most_frequent_token / n_splits > max_dynamic_shared_memory) {
+        ++n_splits;
+    }
 
     cudaFuncSetAttribute(embedding_backward_kernel<Type>, cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_shared_memory);
 
