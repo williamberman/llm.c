@@ -173,6 +173,101 @@ void encoder_forward(floatX* out,
     cudaCheck(cudaGetLastError());
 }
 
+#define BUF_SIZE 5
+#define THREAD_BLOCK_NUM_PROC 5
+
+template<typename Type>
+__global__ void embedding_backward_kernel2(
+    Type *dweight, // VOCAB_SIZE, C
+    const Type *dout, // B, T, C
+    const int *input_tokens, // B, T
+    const int B,
+    const int T,
+    const int C
+) {
+    extern __shared__ Type smem[];
+    __shared__ uint64_t producer_done_barriers[BUF_SIZE];
+    __shared__ uint64_t consumer_done_barriers[BUF_SIZE];
+
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < BUF_SIZE; ++i) {
+            cuda::ptx::mbarrier_init(&producer_done_barriers[i], 1);
+
+            cuda::ptx::mbarrier_arrive_expect_tx(
+                cuda::ptx::sem_release, 
+                cuda::ptx::scope_cta, 
+                cuda::ptx::space_shared, 
+                &producer_done_barriers[i], 
+                sizeof(Type) * C
+            );
+
+            cuda::ptx::mbarrier_init(&consumer_done_barriers[i], 1);
+        }
+
+        cuda::ptx::fence_proxy_async(cuda::ptx::space_cluster);
+    } 
+
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        int n_proc = 0;
+        int wait_parity = 1;
+
+        while (n_proc < THREAD_BLOCK_NUM_PROC) {
+            for (int idx = 0; idx < BUF_SIZE && n_proc < THREAD_BLOCK_NUM_PROC; ++idx) {
+                bool done_waiting = false;
+                while (!done_waiting) {
+                    done_waiting = cuda::ptx::mbarrier_try_wait_parity(&consumer_done_barriers[idx], wait_parity);
+                }
+
+                cuda::ptx::cp_async_bulk(
+                    cuda::ptx::space_cluster, 
+                    cuda::ptx::space_global, 
+                    smem + idx * C, 
+                    dweight, 
+                    C * sizeof(Type), 
+                    &producer_done_barriers[idx]
+                );
+
+                ++n_proc;
+            }
+
+            wait_parity = 1 - wait_parity;
+        }
+    } else if (threadIdx.x >= WARP_SIZE) {
+        int n_proc = 0;
+        int wait_parity = 0;
+
+        while (n_proc < THREAD_BLOCK_NUM_PROC) {
+            for (int idx = 0; idx < BUF_SIZE && n_proc < THREAD_BLOCK_NUM_PROC; ++idx) {
+                bool done_waiting = false;
+                while (!done_waiting) {
+                    done_waiting = cuda::ptx::mbarrier_try_wait_parity(&producer_done_barriers[idx], wait_parity);
+                }
+
+                if (threadIdx.x == WARP_SIZE) {
+                    cuda::ptx::cp_reduce_async_bulk(
+                        cuda::ptx::space_global, 
+                        cuda::ptx::space_shared, 
+                        cuda::ptx::op_add,
+                        dweight, 
+                        smem + idx * C, 
+                        C * sizeof(Type)
+                    );
+
+                    cuda::ptx::cp_async_bulk_commit_group();
+                    cuda::ptx::cp_async_bulk_wait_group(cuda::ptx::n32_t<0>{});
+                    cuda::ptx::mbarrier_arrive(&consumer_done_barriers[idx]);
+                }
+
+                ++n_proc;
+            }
+
+            wait_parity = 1 - wait_parity;
+        }
+    }
+}
+
 #define MAX_DATA_IDX_SMEM_COPIES 155
 
 template<typename Type>
@@ -268,6 +363,34 @@ __global__ void embedding_backward_kernel(
 }
 
 bool embedding_backward_initted = false;
+int max_dynamic_shared_memory = 230000;
+
+template<typename Type>
+void embedding_backward2(
+    Type *dweight,
+    const Type *dout, 
+    const int *input_tokens_device,
+    const int *input_tokens_host,
+    int B,
+    int T,
+    int C,
+    cudaStream_t stream
+) {
+    if (!embedding_backward_initted) {
+        cudaFuncSetAttribute(embedding_backward_kernel2<floatX>, cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_shared_memory);
+        embedding_backward_initted = true;
+    }
+
+    embedding_backward_kernel2<Type><<<1, WARP_SIZE*2, max_dynamic_shared_memory, stream>>>(
+        dweight,
+        dout, 
+        input_tokens_device, 
+        B,
+        T,
+        C
+    );
+    cudaCheck(cudaGetLastError());
+}
 
 std::unordered_map<int, std::pair<int, int>> token_info; // {frequency, current_splits}
 int (*embedding_backward_data_host)[3];
@@ -275,8 +398,6 @@ int (*embedding_backward_data_device)[3];
 
 int (*embedding_backward_data_thread_block_idxes_host)[2];
 int (*embedding_backward_data_thread_block_idxes_device)[2];
-
-int max_dynamic_shared_memory = 230000;
 
 template<typename Type>
 void embedding_backward(
@@ -442,7 +563,7 @@ void encoder_backward_tma(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu ou
     wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
     cudaCheck(cudaGetLastError());
 
-    embedding_backward(dwte, dout, inp, inputs_cpu, B, T, C, stream);
+    embedding_backward2(dwte, dout, inp, inputs_cpu, B, T, C, stream);
 }
 
 // Fully deterministic (see comments in wte_backward_kernel and wpe_backward_kernel for more details)
