@@ -15,6 +15,7 @@ In the backward pass, the gradients flow to both, handled by different kernels
 
 #include <unordered_set>
 #include <assert.h>
+#include <iostream>
 
 #include <cuda_runtime.h>
 #include <cuda/ptx>
@@ -177,8 +178,7 @@ __global__ void embedding_backward_kernel(
     Type *dweight, // VOCAB_SIZE, DIM
     const Type *dout, // B, T, DIM
     const int *input_tokens, // B, T
-    const int *tokens_for_thread_blocks, // n_unique_tokens
-    const int n_splits,
+    const int (*thread_blocks)[3],
     const int B,
     const int T,
     const int DIM
@@ -186,11 +186,14 @@ __global__ void embedding_backward_kernel(
     extern __shared__ Type smem[]; // X, DIM
     __shared__ uint64_t barrier;
     int smem_copies = 0;
-    int thread_block_token = tokens_for_thread_blocks[blockIdx.x / n_splits];
+    int thread_block_token = thread_blocks[blockIdx.x][0];
+    int split = thread_blocks[blockIdx.x][1];
+    int n_splits = thread_blocks[blockIdx.x][2];
 
+    assert(DIM % n_splits == 0);
     int dim = DIM / n_splits;
-    assert(dim % 16 == 0);
-    int offset = (blockIdx.x % n_splits) * dim;
+    assert(dim % 16 == 0 );
+    int offset = split * dim;
 
     if (threadIdx.x == 0) {
         cuda::ptx::mbarrier_init(&barrier, 1);
@@ -242,9 +245,12 @@ __global__ void embedding_backward_kernel(
 }
 
 bool embedding_backward_initted = false;
-int *tokens_for_thread_blocks_host;
-std::unordered_map<int, int> token_frequencies;
-int *tokens_for_thread_blocks_device;
+
+std::unordered_map<int, std::pair<int, int>> token_info; // {frequency, current_splits}
+int (*embedding_backward_thread_blocks_host)[3];
+int (*embedding_backward_thread_blocks_device)[3];
+
+int max_dynamic_shared_memory = 230000;
 
 template<typename Type>
 void embedding_backward(
@@ -257,48 +263,55 @@ void embedding_backward(
     int C,
     cudaStream_t stream
 ) {
-    int n_unique_tokens = 0;
-    int max_frequency = 0;
+    if (!embedding_backward_initted) {
+        cudaFuncSetAttribute(embedding_backward_kernel<floatX>, cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_shared_memory);
+
+        cudaCheck(cudaMallocHost(&embedding_backward_thread_blocks_host, 3 * sizeof(int) * B * T));
+        cudaCheck(cudaMalloc(&embedding_backward_thread_blocks_device, 3 * sizeof(int) * B * T));
+
+        embedding_backward_initted = true;
+    }
+
+    // TODO - no guarantee these splits will properly divide DIM and result will be multiple of 16
+    int n_thread_blocks = 0;
 
     for (int i = 0; i < B * T; ++i) {
         int token = input_tokens_host[i];
+        
+        auto& [frequency, current_splits] = token_info[token];
+        frequency++;
 
-        if (token_frequencies.find(token) == token_frequencies.end()) {
-            tokens_for_thread_blocks_host[n_unique_tokens] = token;
-            token_frequencies[token] = 1;
-            ++n_unique_tokens;
-        } else {
-            ++token_frequencies[token];
-        }
+        int required_memory = frequency * C * sizeof(Type);
+        int new_splits = (required_memory + max_dynamic_shared_memory - 1) / max_dynamic_shared_memory;
 
-        if (token_frequencies[token] > max_frequency) {
-            max_frequency = token_frequencies[token];
+        if (new_splits > current_splits) {
+            embedding_backward_thread_blocks_host[n_thread_blocks][0] = token;
+            embedding_backward_thread_blocks_host[n_thread_blocks][1] = new_splits;
+            n_thread_blocks++;
+            current_splits = new_splits;
         }
     }
 
-    cudaCheck(cudaMemcpyAsync(tokens_for_thread_blocks_device, tokens_for_thread_blocks_host, n_unique_tokens * sizeof(int), cudaMemcpyHostToDevice, stream));
-
-    int max_dynamic_shared_memory = 230000;
-    int smem_of_most_frequent_token = max_frequency * C * sizeof(Type);
-
-    int n_splits = 1;
-    while (C % n_splits != 0 || smem_of_most_frequent_token / n_splits > max_dynamic_shared_memory) {
-        ++n_splits;
+    for (int i = 0; i < n_thread_blocks; ++i) {
+        int token = embedding_backward_thread_blocks_host[i][0];
+        auto& [frequency, current_splits] = token_info[token];
+        embedding_backward_thread_blocks_host[i][2] = current_splits;
     }
 
-    printf("n_splits: %d\n", n_splits);
+    cudaCheck(cudaMemcpyAsync(embedding_backward_thread_blocks_device, embedding_backward_thread_blocks_host, 3 * sizeof(int) * n_thread_blocks, cudaMemcpyHostToDevice, stream));
 
-    embedding_backward_kernel<Type><<<n_unique_tokens*n_splits, 128, max_dynamic_shared_memory, stream>>>(
+    embedding_backward_kernel<Type><<<n_thread_blocks, 128, max_dynamic_shared_memory, stream>>>(
         dweight,
         dout, 
         input_tokens_device, 
-        tokens_for_thread_blocks_device,
-        n_splits,
+        embedding_backward_thread_blocks_device,
         B,
         T,
         C
     );
     cudaCheck(cudaGetLastError());
+
+    token_info.clear();
 }
 
 void encoder_backward_tma(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
@@ -312,18 +325,6 @@ void encoder_backward_tma(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu ou
     const int grid_size = CEIL_DIV(N, block_size);
     wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
     cudaCheck(cudaGetLastError());
-
-    if (!embedding_backward_initted) {
-        int max_dynamic_shared_memory = 230000;
-        cudaFuncSetAttribute(embedding_backward_kernel<floatX>, cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_shared_memory);
-
-        cudaCheck(cudaMallocHost(&tokens_for_thread_blocks_host, B * T * sizeof(int)));
-        cudaCheck(cudaMalloc(&tokens_for_thread_blocks_device, B * T * sizeof(int)));
-
-        embedding_backward_initted = true;
-    }
-
-    token_frequencies.clear();
 
     embedding_backward(dwte, dout, inp, inputs_cpu, B, T, C, stream);
 }
