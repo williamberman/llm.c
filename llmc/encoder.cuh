@@ -349,7 +349,7 @@ void embedding_backward(
 
         embedding_backward_data_thread_block_idxes_host[n_thread_blocks][1] = n_data-1;
     } else if (spread) {
-        int target_memory_per_thread_block = B * T * C * sizeof(Type) / 144;
+        int target_memory_per_thread_block = B * T * C * sizeof(Type) / 114;
 
         if (target_memory_per_thread_block > max_dynamic_shared_memory) {
             target_memory_per_thread_block = max_dynamic_shared_memory;
