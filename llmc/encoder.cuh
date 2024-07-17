@@ -381,7 +381,7 @@ void embedding_backward2(
         embedding_backward_initted = true;
     }
 
-    embedding_backward_kernel2<Type><<<1, WARP_SIZE*2, max_dynamic_shared_memory, stream>>>(
+    embedding_backward_kernel2<Type><<<114, WARP_SIZE*5, max_dynamic_shared_memory, stream>>>(
         dweight,
         dout, 
         input_tokens_device, 
