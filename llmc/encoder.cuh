@@ -173,45 +173,59 @@ void encoder_forward(floatX* out,
     cudaCheck(cudaGetLastError());
 }
 
+#define MAX_DATA_IDX_SMEM_COPIES 155
+
 template<typename Type>
 __global__ void embedding_backward_kernel(
     Type *dweight, // VOCAB_SIZE, DIM
     const Type *dout, // B, T, DIM
     const int *input_tokens, // B, T
-    const int (*thread_blocks)[3],
+    const int (*data)[3],
+    const int (*data_thread_block_idxes)[2],
     const int B,
     const int T,
     const int DIM
 ) {
     extern __shared__ Type smem[]; // X, DIM
     __shared__ uint64_t barrier;
-    int smem_copies = 0;
-    int thread_block_token = thread_blocks[blockIdx.x][0];
-    int split = thread_blocks[blockIdx.x][1];
-    int n_splits = thread_blocks[blockIdx.x][2];
-
-    assert(DIM % n_splits == 0);
-    int dim = DIM / n_splits;
-    assert(dim % 16 == 0 );
-    int offset = split * dim;
+    __shared__ int data_idx_smem_copies[MAX_DATA_IDX_SMEM_COPIES];
 
     if (threadIdx.x == 0) {
         cuda::ptx::mbarrier_init(&barrier, 1);
 
         cuda::ptx::fence_proxy_async(cuda::ptx::space_cluster);
+    
+        int numel_read = 0;
 
-        for (int token_idx = 0; token_idx < B*T; ++token_idx) {
-            if (input_tokens[token_idx] == thread_block_token) {
-                cuda::ptx::cp_async_bulk(
-                    cuda::ptx::space_cluster, 
-                    cuda::ptx::space_global, 
-                    smem + smem_copies * dim, 
-                    dout + token_idx * DIM + offset, 
-                    dim * sizeof(Type), 
-                    &barrier
-                );
-                ++smem_copies;
+        for (int data_idx = data_thread_block_idxes[blockIdx.x][0]; data_idx <= data_thread_block_idxes[blockIdx.x][1]; ++data_idx) {
+            int token    = data[data_idx][0];
+            int split    = data[data_idx][1];
+            int n_splits = data[data_idx][2];
+            int dim = DIM / n_splits;
+            int offset = split * dim;
+
+            assert(DIM % n_splits == 0);
+            assert(dim % 16 == 0 );
+
+            int smem_copies = 0;
+
+            for (int token_idx = 0; token_idx < B*T; ++token_idx) {
+                if (input_tokens[token_idx] == token) {
+                    cuda::ptx::cp_async_bulk(
+                        cuda::ptx::space_cluster, 
+                        cuda::ptx::space_global, 
+                        smem + numel_read, 
+                        dout + token_idx * DIM + offset, 
+                        dim * sizeof(Type), 
+                        &barrier
+                    );
+
+                    numel_read += dim;
+                    ++smem_copies;
+                }
             }
+
+            data_idx_smem_copies[data_idx % MAX_DATA_IDX_SMEM_COPIES] = smem_copies;
         }
 
         cuda::ptx::mbarrier_arrive_expect_tx(
@@ -219,7 +233,7 @@ __global__ void embedding_backward_kernel(
             cuda::ptx::scope_cta, 
             cuda::ptx::space_shared, 
             &barrier, 
-            dim * sizeof(Type) * smem_copies
+            sizeof(Type) * numel_read
         );
     }
 
@@ -231,15 +245,24 @@ __global__ void embedding_backward_kernel(
     }
 
     if (threadIdx.x == 0) {
-        for (int i = 0; i < smem_copies; ++i) {
-            cuda::ptx::cp_reduce_async_bulk(
-                cuda::ptx::space_global, 
-                cuda::ptx::space_shared, 
-                cuda::ptx::op_add, 
-                dweight + thread_block_token * DIM + offset, 
-                smem + i * dim, 
-                dim * sizeof(Type)
-            );
+        for (int data_idx = data_thread_block_idxes[blockIdx.x][0]; data_idx <= data_thread_block_idxes[blockIdx.x][1]; ++data_idx) {
+            int token    = data[data_idx][0];
+            int split    = data[data_idx][1];
+            int n_splits = data[data_idx][2];
+            int dim = DIM / n_splits;
+            int offset = split * dim;
+            int smem_token_copies = data_idx_smem_copies[data_idx % MAX_DATA_IDX_SMEM_COPIES];
+
+            for (int i = 0; i < smem_token_copies; ++i) {
+                cuda::ptx::cp_reduce_async_bulk(
+                    cuda::ptx::space_global, 
+                    cuda::ptx::space_shared, 
+                    cuda::ptx::op_add, 
+                    dweight + token * DIM + offset, 
+                    smem + i * dim, 
+                    dim * sizeof(Type)
+                );
+            }
         }
     }
 }
@@ -247,8 +270,11 @@ __global__ void embedding_backward_kernel(
 bool embedding_backward_initted = false;
 
 std::unordered_map<int, std::pair<int, int>> token_info; // {frequency, current_splits}
-int (*embedding_backward_thread_blocks_host)[3];
-int (*embedding_backward_thread_blocks_device)[3];
+int (*embedding_backward_data_host)[3];
+int (*embedding_backward_data_device)[3];
+
+int (*embedding_backward_data_thread_block_idxes_host)[2];
+int (*embedding_backward_data_thread_block_idxes_device)[2];
 
 int max_dynamic_shared_memory = 230000;
 
@@ -266,14 +292,17 @@ void embedding_backward(
     if (!embedding_backward_initted) {
         cudaFuncSetAttribute(embedding_backward_kernel<floatX>, cudaFuncAttributeMaxDynamicSharedMemorySize, max_dynamic_shared_memory);
 
-        cudaCheck(cudaMallocHost(&embedding_backward_thread_blocks_host, 3 * sizeof(int) * B * T));
-        cudaCheck(cudaMalloc(&embedding_backward_thread_blocks_device, 3 * sizeof(int) * B * T));
+        cudaCheck(cudaMallocHost(&embedding_backward_data_host, 3 * sizeof(int) * B * T));
+        cudaCheck(cudaMalloc(&embedding_backward_data_device, 3 * sizeof(int) * B * T));
+
+        cudaCheck(cudaMallocHost(&embedding_backward_data_thread_block_idxes_host, 2 * sizeof(int) * B * T));
+        cudaCheck(cudaMalloc(&embedding_backward_data_thread_block_idxes_device, 2 * sizeof(int) * B * T));
 
         embedding_backward_initted = true;
     }
 
     // TODO - no guarantee these splits will properly divide DIM and result will be multiple of 16
-    int n_thread_blocks = 0;
+    int n_data = 0;
 
     for (int i = 0; i < B * T; ++i) {
         int token = input_tokens_host[i];
@@ -285,26 +314,113 @@ void embedding_backward(
         int new_splits = (required_memory + max_dynamic_shared_memory - 1) / max_dynamic_shared_memory;
 
         if (new_splits > current_splits) {
-            embedding_backward_thread_blocks_host[n_thread_blocks][0] = token;
-            embedding_backward_thread_blocks_host[n_thread_blocks][1] = new_splits;
-            n_thread_blocks++;
+            embedding_backward_data_host[n_data][0] = token;
+            embedding_backward_data_host[n_data][1] = new_splits;
+            n_data++;
             current_splits = new_splits;
         }
     }
 
-    for (int i = 0; i < n_thread_blocks; ++i) {
-        int token = embedding_backward_thread_blocks_host[i][0];
-        auto& [frequency, current_splits] = token_info[token];
-        embedding_backward_thread_blocks_host[i][2] = current_splits;
+    bool pack = false;
+    bool spread = true;
+    int n_thread_blocks = 0;
+
+    if (pack) {
+        n_thread_blocks = 0;
+        int cur_smem = 0;
+        embedding_backward_data_thread_block_idxes_host[n_thread_blocks][0] = 0;
+
+        for (int i = 0; i < n_data; ++i) {
+            int token = embedding_backward_data_host[i][0];
+            auto& [frequency, current_splits] = token_info[token];
+            embedding_backward_data_host[i][2] = current_splits;
+
+            int smem_for_data = frequency * C * sizeof(Type) / embedding_backward_data_host[i][2];
+            if (cur_smem + smem_for_data > max_dynamic_shared_memory) {
+                embedding_backward_data_thread_block_idxes_host[n_thread_blocks][1] = i-1;
+
+                n_thread_blocks++;
+                embedding_backward_data_thread_block_idxes_host[n_thread_blocks][0] = i;
+                cur_smem = smem_for_data;
+            } else {
+                cur_smem += smem_for_data;
+            }
+        }
+
+        embedding_backward_data_thread_block_idxes_host[n_thread_blocks][1] = n_data-1;
+    } else if (spread) {
+        int target_memory_per_thread_block = B * T * C * sizeof(Type) / 144;
+
+        if (target_memory_per_thread_block > max_dynamic_shared_memory) {
+            target_memory_per_thread_block = max_dynamic_shared_memory;
+        }
+
+        n_thread_blocks = 0;
+        int cur_smem = 0;
+        embedding_backward_data_thread_block_idxes_host[n_thread_blocks][0] = 0;
+
+        for (int i = 0; i < n_data; ++i) {
+            int token = embedding_backward_data_host[i][0];
+            auto& [frequency, current_splits] = token_info[token];
+            embedding_backward_data_host[i][2] = current_splits;
+
+            int smem_for_data = frequency * C * sizeof(Type) / embedding_backward_data_host[i][2];
+
+            if (cur_smem + smem_for_data > target_memory_per_thread_block) {
+                int end_idx = max(embedding_backward_data_thread_block_idxes_host[n_thread_blocks][0], i-1);
+                int next_start_idx = min(end_idx+1, n_data-1);
+                embedding_backward_data_thread_block_idxes_host[n_thread_blocks][1] = end_idx;
+                embedding_backward_data_thread_block_idxes_host[n_thread_blocks+1][0] = next_start_idx;
+
+                n_thread_blocks++;
+                cur_smem = smem_for_data;
+            } else {
+                cur_smem += smem_for_data;
+            }
+        }
+
+        embedding_backward_data_thread_block_idxes_host[n_thread_blocks][1] = n_data-1;
+    } else {
+        n_thread_blocks = n_data;
+        for (int i = 0; i < n_data; ++i) {
+            int token = embedding_backward_data_host[i][0];
+            auto& [frequency, current_splits] = token_info[token];
+            embedding_backward_data_host[i][2] = current_splits;
+
+            embedding_backward_data_host[i][0] = i;
+            embedding_backward_data_host[i][1] = i;
+        }
     }
 
-    cudaCheck(cudaMemcpyAsync(embedding_backward_thread_blocks_device, embedding_backward_thread_blocks_host, 3 * sizeof(int) * n_thread_blocks, cudaMemcpyHostToDevice, stream));
+    for (int i = 0; i < n_thread_blocks; ++i) {
+        assert(embedding_backward_data_thread_block_idxes_host[i][1] - embedding_backward_data_thread_block_idxes_host[i][0] < MAX_DATA_IDX_SMEM_COPIES);
+    }
+
+    // for (int i = 0; i < n_data; ++i) {
+    //     printf("embedding_backward_data_host[%d] = {%d, %d, %d}\n", i, embedding_backward_data_host[i][0], embedding_backward_data_host[i][1], embedding_backward_data_host[i][2]);
+    // }
+
+    // printf("*****************\n");
+
+    // printf("n_thread_blocks = %d\n", n_thread_blocks);
+
+    // for (int i = 0; i <= n_thread_blocks; ++i) {
+    //     printf("embedding_backward_data_thread_block_idxes_host[%d] = {%d, %d}\n", i, embedding_backward_data_thread_block_idxes_host[i][0], embedding_backward_data_thread_block_idxes_host[i][1]);
+    // }
+
+    // printf("*****************\n");
+
+    // exit(1);
+
+    cudaCheck(cudaMemcpyAsync(embedding_backward_data_device, embedding_backward_data_host, 3 * sizeof(int) * n_data, cudaMemcpyHostToDevice, stream));
+    cudaCheck(cudaMemcpyAsync(embedding_backward_data_thread_block_idxes_device, embedding_backward_data_thread_block_idxes_host, 2 * sizeof(int) * n_thread_blocks, cudaMemcpyHostToDevice, stream));
 
     embedding_backward_kernel<Type><<<n_thread_blocks, 128, max_dynamic_shared_memory, stream>>>(
         dweight,
         dout, 
         input_tokens_device, 
-        embedding_backward_thread_blocks_device,
+        embedding_backward_data_device,
+        embedding_backward_data_thread_block_idxes_device,
         B,
         T,
         C
